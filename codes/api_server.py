@@ -294,7 +294,7 @@ def admin_page():
         return HTMLResponse(open(ADMIN_HTML, encoding="utf-8").read())
 
 
-@app.get("/api/ontology/structure", dependencies=[Depends(require_key)])
+@app.get("/api/ontology/structure")
 def ontology_structure(kb: str = Query("", description="知识库名")):
     """本体建模视图数据：类 + Is-A 类别层级(subClassOf) + 对象属性关系 + 实例数。
     按 kb 隔离（不串台）；优先读深化本体(含 subClassOf), 回退该 kb 本体。"""
@@ -331,7 +331,7 @@ def ontology_structure(kb: str = Query("", description="知识库名")):
             "nt_file": os.path.basename(nt_file)}
 
 
-@app.get("/api/ontology/graph-svg", include_in_schema=False, dependencies=[Depends(require_key)])
+@app.get("/api/ontology/graph-svg", include_in_schema=False)
 def ontology_graph_svg():
     """返回企业本体大图 SVG(企业与客户关系 + 本体层次 Is-A)。"""
     svg = os.path.join(ROOT, "..", "docs", "diagrams", "ontology-大图.svg")
@@ -340,7 +340,7 @@ def ontology_graph_svg():
     return HTMLResponse("<div>大图未生成</div>")
 
 
-@app.get("/api/ontology/graph", dependencies=[Depends(require_key)])
+@app.get("/api/ontology/graph")
 def ontology_graph(kb: str = Query("")):
     """本体完整图(节点+边)，供前端 ECharts 动态大图渲染(仿 sme-decision-ontology /graph/full)。
 
@@ -617,9 +617,7 @@ STRICT_AUTH = _env_flag("FOOD_STRICT_AUTH")
 
 # 严格模式下需"任一带凭据主体(read/admin)"的路径(原本匿名可读的业务数据端点)
 _STRICT_READ_PATHS = {
-    "/api/ontology/structure",
-    "/api/ontology/graph",
-    "/api/ontology/graph-svg",
+    # 本体三条(structure/graph/graph-svg)已下移到 _ALWAYS_READ_PATHS(默认即受保护)。
     "/api/app-config",
     "/api/flows",
     "/api/flows/presets",
@@ -627,6 +625,14 @@ _STRICT_READ_PATHS = {
 }
 # 严格模式下需 admin 角色的路径(/admin 是管理后台 HTML 外壳)
 _STRICT_ADMIN_PATHS = {"/admin"}
+# CWE-862: 本体数据端点(类层次/对象属性/关系图)默认即受保护, 不随 FOOD_STRICT_AUTH 灰度开关摇摆——
+# 走既有的 _strict_auth_check 路径级判定(与鉴权审计链同一路径), 不再新增 per-endpoint 依赖
+# (per-endpoint Depends 会绕过审计链, 且在本文件里 require_key 定义于此常量之后会导致 NameError)。
+_ALWAYS_READ_PATHS = {
+    "/api/ontology/structure",
+    "/api/ontology/graph",
+    "/api/ontology/graph-svg",
+}
 # 上传体积上限(可配, MB): 默认 50 —— 与既有文档接入端点的审计上限(P1-5, 50MB)一致,
 # 使文档接收入口不因本改动回归, 同时给原本无界的 CSV 上传补上同一上限。
 MAX_UPLOAD_MB = float(os.environ.get("FOOD_MAX_UPLOAD_MB", "50") or 50)
@@ -661,13 +667,16 @@ async def _read_upload_capped(file, limit_bytes=None, chunk_size=_UPLOAD_CHUNK):
 
 
 def _strict_auth_check(path, principal):
-    """严格鉴权(FOOD_STRICT_AUTH=1)下的路径级放行判断。返回 (status, reason)。
+    """路径级放行判断。返回 (status, reason)。
+
+    覆盖两类: _ALWAYS_READ_PATHS(默认即受保护, 与 FOOD_STRICT_AUTH 开关无关) 与
+    _STRICT_READ_PATHS / _STRICT_ADMIN_PATHS(仅 FOOD_STRICT_AUTH=1 时生效)。
 
     status=0 → 放行; 401 → 缺/无效凭据; 403 → 有凭据但角色不足。
     """
     p = (path or "").rstrip("/") or "/"
     need_admin = p in _STRICT_ADMIN_PATHS
-    need_read = p in _STRICT_READ_PATHS
+    need_read = p in _STRICT_READ_PATHS or p in _ALWAYS_READ_PATHS
     if not (need_admin or need_read):
         return 0, ""
     if not principal or principal.get("denied_reason"):
@@ -1124,8 +1133,10 @@ async def audit_and_count(request: Request, call_next):
         _p = _principal(_extract_key(request.headers.get("x-api-key", ""),
                                      request.headers.get("authorization", "")))
         _princ = _p if (_p and not _p.get("denied_reason")) else None
-        # 严格鉴权灰度开关(第2轮): 默认关 → 完全放行(现状不变); 开 → 受保护路径要凭据。
-        if STRICT_AUTH:
+        # 严格鉴权灰度开关(第2轮): 默认关 → 大多数路径放行; 开 → 全部受保护路径要凭据。
+        # CWE-862 修法: 本体数据端点(_ALWAYS_READ_PATHS)默认即受保护, 不受该开关影响。
+        _path_norm = (request.url.path or "").rstrip("/") or "/"
+        if STRICT_AUTH or _path_norm in _ALWAYS_READ_PATHS:
             _st, _rs = _strict_auth_check(request.url.path, _p)
             if _st:
                 _audit_event("login", subject="anonymous", action="authenticate", result="deny",
